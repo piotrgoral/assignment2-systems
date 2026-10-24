@@ -9,6 +9,10 @@ the graph). Every pass is followed by a synchronize. Configs that run out of mem
 "oom_forward" / "oom_backward" and the grid continues.
 
 Forward and backward passes are wrapped in NVTX ranges ("forward" / "backward"), as in benchmark.py.
+
+`--impls eager compiled` also benchmarks `torch.compile(scaled_dot_product_attention)`, config by config. It is
+compiled afresh for every config (after `torch._dynamo.reset()`), so each shape gets its own static graph instead of
+piling up recompiles. Compilation happens in the first warm-up pass, whose time is recorded as "first_iter_s".
 """
 
 import argparse
@@ -26,6 +30,15 @@ from cs336_systems.benchmark import summarize, synchronize
 
 AttnFn = Callable[..., torch.Tensor]
 
+IMPLS = ("eager", "compiled")
+
+
+def make_attn(impl: str) -> AttnFn:
+    if impl == "eager":
+        return scaled_dot_product_attention
+    torch._dynamo.reset()
+    return torch.compile(scaled_dot_product_attention)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -34,6 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seq-lens", type=int, nargs="+", default=[256, 1024, 4096, 8192, 16384])
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--steps", type=int, default=100)
+    p.add_argument("--impls", choices=IMPLS, nargs="+", default=["eager"], help="attention variants to benchmark")
     p.add_argument("--causal", action="store_true", help="pass a lower-triangular (seq_len x seq_len) bool mask")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
@@ -72,10 +86,19 @@ def bench_config(
             for x in inputs:
                 x.grad = None
 
-        for _ in range(warmup_steps):
-            backward(attn(Q, K, V, mask))
+        # Warm-up runs backward too, so track the stage within it: an OOM there is reported as the pass that hit it.
+        for i in range(warmup_steps):
+            start = timeit.default_timer()
+            stage = "forward"
+            out = attn(Q, K, V, mask)
+            stage = "backward"
+            backward(out)
+            del out
             synchronize(device)
+            if i == 0:
+                result["first_iter_s"] = timeit.default_timer() - start
 
+        stage = "forward"
         forward_times = []
         for _ in range(steps):
             start = timeit.default_timer()
@@ -117,7 +140,7 @@ def bench_config(
 
 
 def format_row(r: dict) -> str:
-    head = f"d={r['d_model']:>4} seq={r['seq_len']:>6}"
+    head = f"{r['impl']:>8} d={r['d_model']:>4} seq={r['seq_len']:>6}"
     if r["status"] != "ok":
         mem = f" | mem before bwd {r['mem_before_backward_bytes'] / 2**20:9.1f} MiB" if "mem_before_backward_bytes" in r else ""
         return f"{head} | {r['status'].upper()}{mem}"
@@ -131,13 +154,12 @@ def main(argv: list[str] | None = None) -> list[dict]:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    attn = scaled_dot_product_attention
-
-    print(f"batch_size={args.batch_size} causal={args.causal} warmup={args.warmup_steps} steps={args.steps} device={device}")
+    print(f"impls={args.impls} batch_size={args.batch_size} causal={args.causal} warmup={args.warmup_steps} steps={args.steps} device={device}")
     results = []
-    for d_model, seq_len in itertools.product(sorted(args.d_models), sorted(args.seq_lens)):
+    for d_model, seq_len, impl in itertools.product(sorted(args.d_models), sorted(args.seq_lens), args.impls):
+        attn = make_attn(impl)
         r = bench_config(attn, args.batch_size, seq_len, d_model, args.causal, args.warmup_steps, args.steps, device)
-        r.update(warmup_steps=args.warmup_steps, steps=args.steps)
+        r.update(impl=impl, warmup_steps=args.warmup_steps, steps=args.steps)
         print(format_row(r), flush=True)
         results.append(r)
         if args.output:

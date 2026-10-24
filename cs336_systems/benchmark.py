@@ -9,6 +9,9 @@ so the backward pass and optimizer step get their own timings.
 Warmup, the measured steps and each phase are wrapped in NVTX ranges ("warmup", "measure", "step_<i>",
 "forward", "backward", "optimizer"), so an nsys profile can skip warmup with
 `--capture-range=nvtx --nvtx-capture=measure` (needs NSYS_NVTX_PROFILER_REGISTER_ONLY=0).
+
+`--compile` wraps the model in torch.compile (the loss and the optimizer stay eager). Compilation happens in the
+first warm-up step, whose time is reported as "first_step_s".
 """
 
 import argparse
@@ -54,6 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--rope-theta", type=float, default=10_000.0)
     p.add_argument("--mode", choices=MODES, default="train", help="what one timed step consists of")
     p.add_argument("--no-grad", action="store_true", help="run forward mode under torch.inference_mode()")
+    p.add_argument("--compile", action="store_true", help="wrap the model in torch.compile")
     p.add_argument("--warmup-steps", type=int, default=5)
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -188,12 +192,19 @@ def make_step_fn(
     return step
 
 
-def benchmark(step_fn: StepFn, warmup_steps: int, steps: int, device: torch.device) -> list[dict[str, float]]:
-    """Returns per-step wall-clock times in seconds, as {"total": ..., <phase>: ...}; synchronizes after every step."""
+def benchmark(
+    step_fn: StepFn, warmup_steps: int, steps: int, device: torch.device
+) -> tuple[list[dict[str, float]], float | None]:
+    """Returns per-step wall-clock times in seconds, as {"total": ..., <phase>: ...}, and the time of the first warm-up
+    step (None without warm-up); synchronizes after every step."""
+    first_step_s = None
     with nvtx.range("warmup"):
-        for _ in range(warmup_steps):
+        for i in range(warmup_steps):
+            start = timeit.default_timer()
             step_fn(PhaseTimer(device))
             synchronize(device)
+            if i == 0:
+                first_step_s = timeit.default_timer() - start
 
     times = []
     with nvtx.range("measure"):
@@ -204,7 +215,7 @@ def benchmark(step_fn: StepFn, warmup_steps: int, steps: int, device: torch.devi
                 step_fn(phase)
                 synchronize(device)
                 times.append(dict(total=timeit.default_timer() - start, **phase.times))
-    return times
+    return times, first_step_s
 
 
 def summarize(times_s: list[float]) -> dict:
@@ -227,13 +238,15 @@ def main(argv: list[str] | None = None) -> dict:
 
     cfg = model_config(args)
     model = build_model(cfg, device)
+    n_params = sum(p.numel() for p in model.parameters())
     x, y = make_batch(args.batch_size, args.context_length, args.vocab_size, device)
     optimizer = AdamW(model.parameters()) if args.mode == "train" else None
+    if args.compile:
+        model = torch.compile(model)
     step_fn = make_step_fn(model, x, y, args.mode, optimizer, args.no_grad)
 
-    times = benchmark(step_fn, args.warmup_steps, args.steps, device)
+    times, first_step_s = benchmark(step_fn, args.warmup_steps, args.steps, device)
 
-    n_params = sum(p.numel() for p in model.parameters())
     result = dict(
         size=size_label(args),
         **cfg,
@@ -241,6 +254,8 @@ def main(argv: list[str] | None = None) -> dict:
         batch_size=args.batch_size,
         mode=args.mode,
         no_grad=args.no_grad,
+        compiled=args.compile,
+        first_step_s=first_step_s,
         warmup_steps=args.warmup_steps,
         steps=args.steps,
         device=str(device),
@@ -248,7 +263,7 @@ def main(argv: list[str] | None = None) -> dict:
     )
 
     print(f"config: {cfg} | batch_size={args.batch_size} | params={n_params / 1e6:.1f}M | device={device}")
-    print(f"mode={args.mode}{' (no_grad)' if args.no_grad else ''} warmup={args.warmup_steps} steps={args.steps}")
+    print(f"mode={args.mode}{' (no_grad)' if args.no_grad else ''} compiled={args.compile} warmup={args.warmup_steps} steps={args.steps}")
     for name, t in result["timings"].items():
         print(f"{name:>9}: mean {t['mean_ms']:.2f} ms | std {t['std_ms']:.2f} ms | min {t['min_ms']:.2f} ms | max {t['max_ms']:.2f} ms")
 
