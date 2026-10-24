@@ -13,6 +13,11 @@ Forward and backward passes are wrapped in NVTX ranges ("forward" / "backward"),
 `--impls eager compiled` also benchmarks `torch.compile(scaled_dot_product_attention)`, config by config. It is
 compiled afresh for every config (after `torch._dynamo.reset()`), so each shape gets its own static graph instead of
 piling up recompiles. Compilation happens in the first warm-up pass, whose time is recorded as "first_iter_s".
+
+`--impls flash_pytorch` benchmarks the pure-PyTorch FlashAttention-2 forward (`FlashAttentionPytorch`), with square
+tiles of `--flash-tile-size`. It has no backward yet, so only the forward is timed (warm-up runs forward only) and
+"mem_before_backward_bytes" is the memory held after a forward pass with its graph alive (Q, K, V, O and L). It
+ignores masks, so it cannot be combined with `--causal`.
 """
 
 import argparse
@@ -27,15 +32,20 @@ import torch.cuda.nvtx as nvtx
 
 from cs336_basics.model import scaled_dot_product_attention
 from cs336_systems.benchmark import summarize, synchronize
+from cs336_systems.flash_attention import FlashAttentionPytorch
 
 AttnFn = Callable[..., torch.Tensor]
 
-IMPLS = ("eager", "compiled")
+IMPLS = ("eager", "compiled", "flash_pytorch")
+FORWARD_ONLY_IMPLS = {"flash_pytorch"}
 
 
-def make_attn(impl: str) -> AttnFn:
+def make_attn(impl: str, flash_tile_size: int) -> AttnFn:
     if impl == "eager":
         return scaled_dot_product_attention
+    if impl == "flash_pytorch":
+        FlashAttentionPytorch.Q_TILE_SIZE = FlashAttentionPytorch.K_TILE_SIZE = flash_tile_size
+        return lambda Q, K, V, mask: FlashAttentionPytorch.apply(Q, K, V)
     torch._dynamo.reset()
     return torch.compile(scaled_dot_product_attention)
 
@@ -48,6 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--impls", choices=IMPLS, nargs="+", default=["eager"], help="attention variants to benchmark")
+    p.add_argument("--flash-tile-size", type=int, default=16, help="Bq = Bk for flash_pytorch")
     p.add_argument("--causal", action="store_true", help="pass a lower-triangular (seq_len x seq_len) bool mask")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
@@ -74,6 +85,7 @@ def bench_config(
     warmup_steps: int,
     steps: int,
     device: torch.device,
+    run_backward: bool = True,
 ) -> dict:
     result = dict(batch_size=batch_size, d_model=d_model, seq_len=seq_len, causal=causal, device=str(device))
     stage = "forward"
@@ -91,8 +103,9 @@ def bench_config(
             start = timeit.default_timer()
             stage = "forward"
             out = attn(Q, K, V, mask)
-            stage = "backward"
-            backward(out)
+            if run_backward:
+                stage = "backward"
+                backward(out)
             del out
             synchronize(device)
             if i == 0:
@@ -107,11 +120,16 @@ def bench_config(
                 synchronize(device)
             forward_times.append(timeit.default_timer() - start)
 
-        stage = "backward"
         torch.cuda.reset_peak_memory_stats(device)
         out = attn(Q, K, V, mask)
         synchronize(device)
         result["mem_before_backward_bytes"] = torch.cuda.memory_allocated(device)
+        if not run_backward:
+            del out
+            result["peak_mem_bytes"] = torch.cuda.max_memory_allocated(device)
+            result.update(status="ok", forward=summarize(forward_times))
+            return result
+        stage = "backward"
         backward(out)
         del out
         synchronize(device)
@@ -140,12 +158,13 @@ def bench_config(
 
 
 def format_row(r: dict) -> str:
-    head = f"{r['impl']:>8} d={r['d_model']:>4} seq={r['seq_len']:>6}"
+    head = f"{r['impl']:>13} d={r['d_model']:>4} seq={r['seq_len']:>6}"
     if r["status"] != "ok":
         mem = f" | mem before bwd {r['mem_before_backward_bytes'] / 2**20:9.1f} MiB" if "mem_before_backward_bytes" in r else ""
         return f"{head} | {r['status'].upper()}{mem}"
+    bwd = f"{r['backward']['mean_ms']:9.3f} ms" if "backward" in r else f"{'n/a':>12}"
     return (
-        f"{head} | fwd {r['forward']['mean_ms']:9.3f} ms | bwd {r['backward']['mean_ms']:9.3f} ms"
+        f"{head} | fwd {r['forward']['mean_ms']:9.3f} ms | bwd {bwd}"
         f" | mem before bwd {r['mem_before_backward_bytes'] / 2**20:9.1f} MiB | peak {r['peak_mem_bytes'] / 2**20:9.1f} MiB"
     )
 
@@ -154,12 +173,17 @@ def main(argv: list[str] | None = None) -> list[dict]:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    print(f"impls={args.impls} batch_size={args.batch_size} causal={args.causal} warmup={args.warmup_steps} steps={args.steps} device={device}")
+    if args.causal and FORWARD_ONLY_IMPLS & set(args.impls):
+        raise SystemExit("flash_pytorch ignores masks, so it cannot be run with --causal")
+    print(f"impls={args.impls} flash_tile_size={args.flash_tile_size} batch_size={args.batch_size} causal={args.causal} warmup={args.warmup_steps} steps={args.steps} device={device}")
     results = []
     for d_model, seq_len, impl in itertools.product(sorted(args.d_models), sorted(args.seq_lens), args.impls):
-        attn = make_attn(impl)
-        r = bench_config(attn, args.batch_size, seq_len, d_model, args.causal, args.warmup_steps, args.steps, device)
+        attn = make_attn(impl, args.flash_tile_size)
+        run_backward = impl not in FORWARD_ONLY_IMPLS
+        r = bench_config(attn, args.batch_size, seq_len, d_model, args.causal, args.warmup_steps, args.steps, device, run_backward)
         r.update(impl=impl, warmup_steps=args.warmup_steps, steps=args.steps)
+        if impl == "flash_pytorch":
+            r["tile_size"] = args.flash_tile_size
         print(format_row(r), flush=True)
         results.append(r)
         if args.output:
