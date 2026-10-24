@@ -96,8 +96,5 @@ Smoke test: `uv run python -m cs336_systems.attention_benchmark --impls eager fl
 
 ## Next steps
 
-- (c) Causal masking in the Triton kernel: an `is_causal: tl.constexpr` parameter, add -1e6 to the masked entries of
-  S_ij, keep `ctx.is_causal = is_causal`. Same test, parametrized with `is_causal=True`.
-- flash_backward: implement `backward` (PyTorch, can be `torch.compile`d) from the saved `L, Q, K, V, O` with
-  recomputation (Eq. 13–19, including the D vector). Test with
-  `uv run pytest -k test_flash_backward`.
+Done: (c) causal masking (`is_causal: tl.constexpr`, -1e6 on masked scores, `ctx.is_causal`) and flash_backward
+(compiled PyTorch, Eq. 13–19). Both are covered by `uv run pytest -k flash`. Benchmarks: `4_2_flash_benchmarking.md`.

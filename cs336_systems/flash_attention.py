@@ -9,7 +9,15 @@ FlashAttentionTriton runs the same algorithm as one fused Triton kernel (flash_f
 (T_q, batch_size): each program instance owns one query tile of one batch element, keeps Q_i and the fp32 state
 (O_i, l, m) on chip and loops once over the key tiles. Leading batch dims are flattened into one before the launch.
 
-Both forward passes save L (logsumexp of the attention scores), Q, K, V and O for the backward pass.
+With is_causal=True, both forward passes add -1e6 to the scores of keys that come after the query. The Triton kernel
+also stops its key loop at the diagonal: later key tiles are fully masked and would add exactly 0.
+
+FlashAttentionTriton picks its tile sizes (and num_warps / num_stages) with triton.autotune, per sequence lengths,
+head dim, dtype and is_causal, unless Q_TILE_SIZE / K_TILE_SIZE are set on the class, which forces fixed tiles.
+
+Both forward passes save L (logsumexp of the attention scores), Q, K, V and O for the backward pass. The backward
+(shared by both classes) is plain PyTorch under torch.compile: it recomputes P = exp(S - L) from Q, K and L instead
+of reading a stored attention matrix, and uses D = rowsum(O * dO) so no softmax is needed (Eqs. 13-19).
 """
 
 import math
@@ -17,6 +25,30 @@ import math
 import torch
 import triton
 import triton.language as tl
+
+
+def _causal_mask(n_queries, n_keys, device):
+    return torch.arange(n_queries, device=device)[:, None] >= torch.arange(n_keys, device=device)[None, :]
+
+
+def _flash_backward(Q, K, V, O, dO, L, is_causal: bool):
+    scale = 1 / math.sqrt(Q.shape[-1])
+    Qf, Kf, Vf, Of, dOf = (t.float() for t in (Q, K, V, O, dO))
+
+    D = (Of * dOf).sum(dim=-1)
+    S = Qf @ Kf.mT * scale  # (13)
+    if is_causal:
+        S = torch.where(_causal_mask(Q.shape[-2], K.shape[-2], Q.device), S, S - 1e6)
+    P = torch.exp(S - L[..., None])  # (14)
+    dV = P.mT @ dOf  # (15)
+    dP = dOf @ Vf.mT  # (16)
+    dS = P * (dP - D[..., None])  # (17)
+    dQ = dS @ Kf * scale  # (18)
+    dK = dS.mT @ Qf * scale  # (19)
+    return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype)
+
+
+_flash_backward_compiled = torch.compile(_flash_backward)
 
 
 class FlashAttentionPytorch(torch.autograd.Function):
@@ -46,6 +78,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
                 V_j = V[..., k_start : k_start + Bk, :].float()
 
                 S_ij = Q_i @ K_j.mT * scale
+                if is_causal:
+                    mask = _causal_mask(n_queries, n_keys, Q.device)[q_start : q_start + Bq, k_start : k_start + Bk]
+                    S_ij = torch.where(mask, S_ij, S_ij - 1e6)
                 m_new = torch.maximum(m_i, S_ij.amax(dim=-1))
                 P_ij = torch.exp(S_ij - m_new[..., None])
                 alpha = torch.exp(m_i - m_new)
@@ -62,7 +97,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError
+        L, Q, K, V, O = ctx.saved_tensors
+        dQ, dK, dV = _flash_backward_compiled(Q, K, V, O, grad_out, L, ctx.is_causal)
+        return dQ, dK, dV, None
 
 
 @triton.jit
@@ -79,6 +116,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):  # fmt: skip
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -133,11 +171,20 @@ def flash_fwd_kernel(
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m_i = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
 
-    for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    q_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
+    n_key_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    if is_causal:
+        # Key tiles past the last query of this tile are fully masked.
+        n_key_tiles = tl.minimum(n_key_tiles, tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE))
+    for j in range(n_key_tiles):
         K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale
+        if is_causal:
+            k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            S_ij = tl.where(q_idx[:, None] >= k_idx[None, :], S_ij, S_ij - 1e6)
         m_new = tl.maximum(m_i, tl.max(S_ij, axis=1))
         P_ij = tl.exp(S_ij - m_new[:, None])
         alpha = tl.exp(m_i - m_new)
@@ -154,9 +201,34 @@ def flash_fwd_kernel(
     tl.store(L_block_ptr, L_i, boundary_check=(0,))
 
 
+def _prune_tile_configs(configs, named_args, **kwargs):
+    # Keep tiles that evenly divide the sequence lengths (padded keys would get score 0, not be masked out).
+    n_queries, n_keys = named_args["N_QUERIES"], named_args["N_KEYS"]
+    kept = [
+        c for c in configs
+        if n_queries % c.kwargs["Q_TILE_SIZE"] == 0 and n_keys % c.kwargs["K_TILE_SIZE"] == 0
+    ]  # fmt: skip
+    return kept or [triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16})]
+
+
+_TILE_CONFIGS = [
+    triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_warps=num_warps, num_stages=num_stages)
+    for bq, bk in [(16, 16), (32, 32), (32, 64), (64, 32), (64, 64), (128, 32), (128, 64), (128, 128)]
+    for num_warps in (4, 8)
+    for num_stages in (2, 3)
+]
+
+flash_fwd_kernel_autotuned = triton.autotune(
+    configs=_TILE_CONFIGS,
+    key=["N_QUERIES", "N_KEYS", "D", "is_causal"],  # the autotuner also keys on the tensors' dtypes
+    prune_configs_by={"early_config_prune": _prune_tile_configs},
+)(flash_fwd_kernel)
+
+
 class FlashAttentionTriton(torch.autograd.Function):
-    Q_TILE_SIZE = 16
-    K_TILE_SIZE = 16
+    # None: autotune the tiles. Set both to an int to force fixed square or rectangular tiles.
+    Q_TILE_SIZE = None
+    K_TILE_SIZE = None
 
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
@@ -164,7 +236,8 @@ class FlashAttentionTriton(torch.autograd.Function):
         n_queries, d = Q.shape[-2:]
         n_keys = K.shape[-2]
         Bq, Bk = FlashAttentionTriton.Q_TILE_SIZE, FlashAttentionTriton.K_TILE_SIZE
-        assert n_queries % Bq == 0 and n_keys % Bk == 0, "sequence lengths must be multiples of the tile sizes"
+        autotune = Bq is None
+        assert autotune or (n_queries % Bq == 0 and n_keys % Bk == 0), "sequence lengths must be multiples of the tile sizes"
         batch_shape = Q.shape[:-2]
 
         # The grid has a single batch axis, so flatten all leading dims into one.
@@ -173,7 +246,15 @@ class FlashAttentionTriton(torch.autograd.Function):
         O = torch.empty_like(Q3)
         L = torch.empty(batch_size, n_queries, device=Q.device, dtype=torch.float32)
 
-        flash_fwd_kernel[(triton.cdiv(n_queries, Bq), batch_size)](
+        if autotune:
+            kernel = flash_fwd_kernel_autotuned
+            grid = lambda meta: (triton.cdiv(n_queries, meta["Q_TILE_SIZE"]), batch_size)  # noqa: E731
+            tiles = {}
+        else:
+            kernel = flash_fwd_kernel
+            grid = (triton.cdiv(n_queries, Bq), batch_size)
+            tiles = dict(Q_TILE_SIZE=Bq, K_TILE_SIZE=Bk)
+        kernel[grid](
             Q3, K3, V3,
             O, L,
             Q3.stride(0), Q3.stride(1), Q3.stride(2),
@@ -184,8 +265,8 @@ class FlashAttentionTriton(torch.autograd.Function):
             n_queries, n_keys,
             1 / math.sqrt(d),
             D=d,
-            Q_TILE_SIZE=Bq,
-            K_TILE_SIZE=Bk,
+            is_causal=is_causal,
+            **tiles,
         )  # fmt: skip
 
         O = O.view(Q.shape)
@@ -196,4 +277,6 @@ class FlashAttentionTriton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError
+        L, Q, K, V, O = ctx.saved_tensors
+        dQ, dK, dV = _flash_backward_compiled(Q, K, V, O, grad_out, L, ctx.is_causal)
+        return dQ, dK, dV, None
