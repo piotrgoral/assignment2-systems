@@ -1,0 +1,4 @@
+{"case": "fp32 acc += fp32", "result_dtype": "torch.float32", "value": 10.000133514404297, "abs_error": 0.000133514404296875}
+{"case": "fp16 acc += fp16", "result_dtype": "torch.float16", "value": 9.953125, "abs_error": 0.046875}
+{"case": "fp32 acc += fp16 (implicit upcast)", "result_dtype": "torch.float32", "value": 10.00213623046875, "abs_error": 0.00213623046875}
+{"case": "fp32 acc += fp16.type(fp32)", "result_dtype": "torch.float32", "value": 10.00213623046875, "abs_error": 0.00213623046875}
