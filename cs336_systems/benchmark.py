@@ -12,6 +12,9 @@ Warmup, the measured steps and each phase are wrapped in NVTX ranges ("warmup", 
 
 `--compile` wraps the model in torch.compile (the loss and the optimizer stay eager). Compilation happens in the
 first warm-up step, whose time is reported as "first_step_s".
+
+`--mixed-precision bf16` runs the forward pass and the loss under torch.autocast with bfloat16 (params stay fp32;
+backward and the optimizer step run outside autocast).
 """
 
 import argparse
@@ -20,7 +23,7 @@ import math
 import statistics
 import timeit
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -43,6 +46,8 @@ MODEL_SIZES = {
 
 MODES = ("forward", "forward_backward", "train")
 
+MIXED_PRECISION_DTYPES = {"none": None, "bf16": torch.bfloat16}
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -58,6 +63,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mode", choices=MODES, default="train", help="what one timed step consists of")
     p.add_argument("--no-grad", action="store_true", help="run forward mode under torch.inference_mode()")
     p.add_argument("--compile", action="store_true", help="wrap the model in torch.compile")
+    p.add_argument(
+        "--mixed-precision",
+        choices=MIXED_PRECISION_DTYPES,
+        default="none",
+        help="run forward + loss under torch.autocast with this dtype",
+    )
     p.add_argument("--warmup-steps", type=int, default=5)
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -155,22 +166,21 @@ def make_step_fn(
     mode: str,
     optimizer: torch.optim.Optimizer | None = None,
     no_grad: bool = False,
+    autocast: Callable[[], AbstractContextManager] = nullcontext,
 ) -> StepFn:
+    """`autocast` is called to get the context manager around forward + loss (e.g. a torch.autocast factory)."""
     if mode == "forward":
 
         def step(phase: PhaseTimer) -> None:
             with phase("forward"):
-                if no_grad:
-                    with torch.inference_mode():
-                        cross_entropy(model(x), y)
-                else:
+                with torch.inference_mode() if no_grad else nullcontext(), autocast():
                     cross_entropy(model(x), y)
 
     elif mode == "forward_backward":
 
         def step(phase: PhaseTimer) -> None:
             model.zero_grad(set_to_none=True)
-            with phase("forward"):
+            with phase("forward"), autocast():
                 loss = cross_entropy(model(x), y)
             with phase("backward"):
                 loss.backward()
@@ -180,7 +190,7 @@ def make_step_fn(
 
         def step(phase: PhaseTimer) -> None:
             optimizer.zero_grad(set_to_none=True)
-            with phase("forward"):
+            with phase("forward"), autocast():
                 loss = cross_entropy(model(x), y)
             with phase("backward"):
                 loss.backward()
@@ -243,7 +253,9 @@ def main(argv: list[str] | None = None) -> dict:
     optimizer = AdamW(model.parameters()) if args.mode == "train" else None
     if args.compile:
         model = torch.compile(model)
-    step_fn = make_step_fn(model, x, y, args.mode, optimizer, args.no_grad)
+    autocast_dtype = MIXED_PRECISION_DTYPES[args.mixed_precision]
+    autocast = (lambda: torch.autocast(device_type=device.type, dtype=autocast_dtype)) if autocast_dtype else nullcontext
+    step_fn = make_step_fn(model, x, y, args.mode, optimizer, args.no_grad, autocast)
 
     times, first_step_s = benchmark(step_fn, args.warmup_steps, args.steps, device)
 
@@ -255,6 +267,7 @@ def main(argv: list[str] | None = None) -> dict:
         mode=args.mode,
         no_grad=args.no_grad,
         compiled=args.compile,
+        mixed_precision=args.mixed_precision,
         first_step_s=first_step_s,
         warmup_steps=args.warmup_steps,
         steps=args.steps,
@@ -263,7 +276,7 @@ def main(argv: list[str] | None = None) -> dict:
     )
 
     print(f"config: {cfg} | batch_size={args.batch_size} | params={n_params / 1e6:.1f}M | device={device}")
-    print(f"mode={args.mode}{' (no_grad)' if args.no_grad else ''} compiled={args.compile} warmup={args.warmup_steps} steps={args.steps}")
+    print(f"mode={args.mode}{' (no_grad)' if args.no_grad else ''} compiled={args.compile} mixed_precision={args.mixed_precision} warmup={args.warmup_steps} steps={args.steps}")
     for name, t in result["timings"].items():
         print(f"{name:>9}: mean {t['mean_ms']:.2f} ms | std {t['std_ms']:.2f} ms | min {t['min_ms']:.2f} ms | max {t['max_ms']:.2f} ms")
 
