@@ -18,6 +18,10 @@ piling up recompiles. Compilation happens in the first warm-up pass, whose time 
 tiles of `--flash-tile-size`. It has no backward yet, so only the forward is timed (warm-up runs forward only) and
 "mem_before_backward_bytes" is the memory held after a forward pass with its graph alive (Q, K, V, O and L). It
 ignores masks, so it cannot be combined with `--causal`.
+
+`--impls flash_triton` does the same for the Triton FlashAttention-2 forward kernel (`FlashAttentionTriton`): square
+tiles of `--flash-tile-size`, forward only, no `--causal`. A tile size whose kernel needs more shared memory than the
+GPU has is recorded as "out_of_shared_memory" and the grid continues.
 """
 
 import argparse
@@ -29,15 +33,16 @@ from collections.abc import Callable
 
 import torch
 import torch.cuda.nvtx as nvtx
+from triton.runtime.errors import OutOfResources
 
 from cs336_basics.model import scaled_dot_product_attention
 from cs336_systems.benchmark import summarize, synchronize
-from cs336_systems.flash_attention import FlashAttentionPytorch
+from cs336_systems.flash_attention import FlashAttentionPytorch, FlashAttentionTriton
 
 AttnFn = Callable[..., torch.Tensor]
 
-IMPLS = ("eager", "compiled", "flash_pytorch")
-FORWARD_ONLY_IMPLS = {"flash_pytorch"}
+IMPLS = ("eager", "compiled", "flash_pytorch", "flash_triton")
+FORWARD_ONLY_IMPLS = {"flash_pytorch", "flash_triton"}
 
 
 def make_attn(impl: str, flash_tile_size: int) -> AttnFn:
@@ -46,6 +51,9 @@ def make_attn(impl: str, flash_tile_size: int) -> AttnFn:
     if impl == "flash_pytorch":
         FlashAttentionPytorch.Q_TILE_SIZE = FlashAttentionPytorch.K_TILE_SIZE = flash_tile_size
         return lambda Q, K, V, mask: FlashAttentionPytorch.apply(Q, K, V)
+    if impl == "flash_triton":
+        FlashAttentionTriton.Q_TILE_SIZE = FlashAttentionTriton.K_TILE_SIZE = flash_tile_size
+        return lambda Q, K, V, mask: FlashAttentionTriton.apply(Q, K, V)
     torch._dynamo.reset()
     return torch.compile(scaled_dot_product_attention)
 
@@ -58,7 +66,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--impls", choices=IMPLS, nargs="+", default=["eager"], help="attention variants to benchmark")
-    p.add_argument("--flash-tile-size", type=int, default=16, help="Bq = Bk for flash_pytorch")
+    p.add_argument("--flash-tile-size", type=int, default=16, help="Bq = Bk for flash_pytorch and flash_triton")
     p.add_argument("--causal", action="store_true", help="pass a lower-triangular (seq_len x seq_len) bool mask")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
@@ -149,6 +157,8 @@ def bench_config(
         result.update(status="ok", forward=summarize(forward_times), backward=summarize(backward_times))
     except torch.OutOfMemoryError:
         result["status"] = f"oom_{stage}"
+    except OutOfResources:
+        result["status"] = "out_of_shared_memory"
     finally:
         # Drop every local tensor (including a half-built graph) before the next config.
         Q = K = V = mask = grad_out = inputs = out = None  # noqa: F841
@@ -174,7 +184,7 @@ def main(argv: list[str] | None = None) -> list[dict]:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     if args.causal and FORWARD_ONLY_IMPLS & set(args.impls):
-        raise SystemExit("flash_pytorch ignores masks, so it cannot be run with --causal")
+        raise SystemExit("flash_pytorch / flash_triton ignore masks, so they cannot be run with --causal")
     print(f"impls={args.impls} flash_tile_size={args.flash_tile_size} batch_size={args.batch_size} causal={args.causal} warmup={args.warmup_steps} steps={args.steps} device={device}")
     results = []
     for d_model, seq_len, impl in itertools.product(sorted(args.d_models), sorted(args.seq_lens), args.impls):
@@ -182,7 +192,7 @@ def main(argv: list[str] | None = None) -> list[dict]:
         run_backward = impl not in FORWARD_ONLY_IMPLS
         r = bench_config(attn, args.batch_size, seq_len, d_model, args.causal, args.warmup_steps, args.steps, device, run_backward)
         r.update(impl=impl, warmup_steps=args.warmup_steps, steps=args.steps)
-        if impl == "flash_pytorch":
+        if impl in FORWARD_ONLY_IMPLS:
             r["tile_size"] = args.flash_tile_size
         print(format_row(r), flush=True)
         results.append(r)

@@ -15,6 +15,7 @@
   --flash: #0b7a85; --flash-soft: #d2eef0;      /* tiled flash */
   --hot: #c4302a; --hot-soft: #f9dedb;          /* bottlenecks */
   --ok: #2f7d3b; --ok-soft: #dcefdc;
+  --tri: #6b48c8;                               /* fused Triton kernel (scoreboard) */
   --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
   --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
   --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -22,11 +23,11 @@
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --bg: #0e1116; --surface: #161b22; --ink: #e5e9ef; --muted: #98a2b1; --line: #2a323d; --code-bg: #11161d;
   --hbm: #f0a640; --hbm-soft: #3a2b12; --flash: #45c4ce; --flash-soft: #113439;
-  --hot: #ff6d63; --hot-soft: #3e1b19; --ok: #6fcf7c; --ok-soft: #173220; color-scheme: dark } }
+  --hot: #ff6d63; --hot-soft: #3e1b19; --ok: #6fcf7c; --ok-soft: #173220; --tri: #a68bf2; color-scheme: dark } }
 :root[data-theme="dark"] {
   --bg: #0e1116; --surface: #161b22; --ink: #e5e9ef; --muted: #98a2b1; --line: #2a323d; --code-bg: #11161d;
   --hbm: #f0a640; --hbm-soft: #3a2b12; --flash: #45c4ce; --flash-soft: #113439;
-  --hot: #ff6d63; --hot-soft: #3e1b19; --ok: #6fcf7c; --ok-soft: #173220; color-scheme: dark }
+  --hot: #ff6d63; --hot-soft: #3e1b19; --ok: #6fcf7c; --ok-soft: #173220; --tri: #a68bf2; color-scheme: dark }
 
 body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 15px; line-height: 1.5; }
 .wrap { max-width: 1320px; margin: 0 auto; padding-block: 28px 56px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 22px; }
@@ -136,9 +137,9 @@ svg .axis { stroke: var(--line); }
 .ticks span { position: absolute; transform: translateX(-50%); }
 .ticks span:first-child { transform: none; }
 .launch { font-family: var(--f-mono); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
-.fill.c-eager { background: var(--hbm); } .fill.c-comp { background: var(--hbm); opacity: .6; } .fill.c-flash { background: var(--flash); } .fill.c-flash16 { background: var(--flash); opacity: .55; }
+.fill.c-eager { background: var(--hbm); } .fill.c-comp { background: var(--hbm); opacity: .6; } .fill.c-flash { background: var(--flash); } .fill.c-flash16 { background: var(--flash); opacity: .55; } .fill.c-triton { background: var(--tri); }
 
-table.diff { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 14px; }
+table.diff { border-collapse: collapse; width: 100%; min-width: 920px; font-size: 14px; }
 table.diff th, table.diff td { text-align: left; padding: 9px 12px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.diff th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom-color: var(--ink); }
 table.diff td:first-child { font-weight: 600; width: 22%; }
@@ -157,9 +158,9 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
 <body>
 <div class="wrap">
   <header>
-    <div class="eyebrow">cs336 assignment 2 · §4.1 vs §4.2.2 · A10, fp32, batch 8, one head</div>
-    <h1>Eager attention vs FlashAttentionPytorch</h1>
-    <p class="lede">Left: <b>naive <code>scaled_dot_product_attention</code></b>. It runs about 8 big kernels, and every one reads or writes a full <b>B·N²</b> score tensor in HBM. Right: <b><code>FlashAttentionPytorch.forward</code></b>. It walks the score matrix one tile at a time with an online softmax, so no N² tensor ever exists, but it runs about 14 tiny kernels for every tile pair. Step through both. The red chips mark where the time and memory go, using the numbers from the 4.1, 4.2 and 4.2.2 write-ups.</p>
+    <div class="eyebrow">cs336 assignment 2 · §4.1 vs §4.2.2 / §4.2.3 · A10, fp32, batch 8, one head</div>
+    <h1>Eager attention vs FlashAttention, in PyTorch and Triton</h1>
+    <p class="lede">Left: <b>naive <code>scaled_dot_product_attention</code></b>. It runs about 8 big kernels, and every one reads or writes a full <b>B·N²</b> score tensor in HBM. Right: <b><code>FlashAttentionPytorch.forward</code></b>. It walks the score matrix one tile at a time with an online softmax, so no N² tensor ever exists, but it runs about 14 tiny kernels for every tile pair. Press <b>Triton kernel</b> to run the same loop as <b><code>flash_fwd_kernel</code></b> instead: one launch for the whole forward pass, and S_ij and P_ij never leave registers. Step through both. The red chips mark where the time and memory go, using the numbers from the 4.1, 4.2, 4.2.2 and 4.2.3 write-ups.</p>
   </header>
 
   <section class="config" aria-label="Benchmark configuration">
@@ -168,8 +169,8 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
     <div class="field"><label for="cfg-n">seq_len N</label>
       <select id="cfg-n"><option>256</option><option>1024</option><option>4096</option><option selected>8192</option><option>16384</option></select></div>
     <div class="field"><label for="cfg-t">flash tile B<sub>q</sub> = B<sub>k</sub></label>
-      <select id="cfg-t"><option selected>128</option><option>16</option></select></div>
-    <p class="hint">The animations use a toy 4 × 4 tile grid. The meters, counters and the scoreboard use this config. Try N = 16 384 to see eager run out of memory at the <code>exp</code> kernel while compiled and flash fit.</p>
+      <select id="cfg-t"><option>16</option><option>32</option><option>64</option><option selected>128</option></select></div>
+    <p class="hint">The animations use a toy 4 × 4 tile grid. The meters, counters and the scoreboard use this config. Try N = 16 384 to see eager run out of memory at the <code>exp</code> kernel while compiled and flash fit. The PyTorch flash version was only timed with 128-tiles (and with 16-tiles at d = 64, N ≤ 1024). The Triton kernel was timed at every tile size, except where the tile does not fit in the 99 KiB of shared memory (128 at d ≥ 64, 64 at d = 128).</p>
   </section>
 
   <div class="lanes">
@@ -223,10 +224,10 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
     </section>
 
     <!-- ============ LANE B ============ -->
-    <section class="lane" id="laneB" aria-label="Tiled FlashAttention in PyTorch">
+    <section class="lane" id="laneB" aria-label="Tiled FlashAttention">
       <div class="lane-head">
-        <h2><span class="swatch" style="background:var(--flash)"></span>FlashAttentionPytorch</h2>
-        <span class="src">cs336_systems/flash_attention.py</span>
+        <h2><span class="swatch" style="background:var(--flash)"></span><span id="b-name">FlashAttentionPytorch</span></h2>
+        <span class="src" id="b-src">cs336_systems/flash_attention.py</span>
       </div>
       <div class="controls">
         <button id="b-play" type="button">Pause</button>
@@ -234,12 +235,13 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
         <button id="b-next" type="button" aria-label="Next step">▶</button>
         <button id="b-skip" type="button">Next query tile</button>
         <button id="b-reset" type="button">Restart</button>
+        <button id="b-triton" type="button" aria-pressed="false">Triton kernel</button>
         <label class="eyebrow" for="speed">speed</label><input id="speed" type="range" min="0.25" max="4" step="0.25" value="1">
         <span class="step-label" id="b-step"></span>
       </div>
       <div class="diagram">
         <svg id="b-svg" viewBox="0 0 520 240" role="img" aria-label="Tile grid of the score matrix">
-          <text x="96" y="14" font-size="9" class="t-muted">K_j, V_j tiles (read from HBM)</text>
+          <text x="96" y="14" font-size="9" class="t-muted" id="b-kv-cap">K_j, V_j tiles (read from HBM)</text>
           <g id="b-k"></g>
           <text x="10" y="62" font-size="9" class="t-muted">Q_i</text>
           <g id="b-q"></g>
@@ -249,8 +251,8 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
           <text x="334" y="62" font-size="9" class="t-muted">L_i</text>
           <g id="b-o"></g>
           <rect class="box" x="370" y="26" width="144" height="180" rx="6"/>
-          <text x="442" y="44" text-anchor="middle" font-size="11" font-weight="600">tile temporaries</text>
-          <text x="442" y="57" text-anchor="middle" font-size="9" class="t-muted">B·Bq·Bk, reused each step</text>
+          <text x="442" y="44" text-anchor="middle" font-size="11" font-weight="600" id="b-tmp-title">tile temporaries</text>
+          <text x="442" y="57" text-anchor="middle" font-size="9" class="t-muted" id="b-tmp-sub">B·Bq·Bk, reused each step</text>
           <rect id="b-sij" class="slot empty" x="402" y="68" width="44" height="44" rx="2"/>
           <text id="b-sij-l" x="424" y="94" text-anchor="middle" font-size="10">S_ij</text>
           <rect id="b-acc" class="slot empty" x="456" y="68" width="40" height="44" rx="2"/>
@@ -273,8 +275,8 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
       <div class="readouts">
         <div class="ro"><span class="k">N² tensors live</span><span class="v">0 (one tile at a time)</span></div>
         <div class="ro"><span class="k">memory for this config</span><span class="v" id="b-mem">—</span><div class="meter flash" id="b-meter"><i></i></div></div>
-        <div class="ro"><span class="k">N² passes, summed over tiles (read / write)</span><span class="v" id="b-traffic">0 / 0</span></div>
-        <div class="ro"><span class="k">kernel launches so far (toy grid)</span><span class="v" id="b-launch">0</span></div>
+        <div class="ro"><span class="k" id="b-traffic-k">N² passes, summed over tiles (read / write)</span><span class="v" id="b-traffic">0 / 0</span></div>
+        <div class="ro"><span class="k" id="b-launch-k">kernel launches so far (toy grid)</span><span class="v" id="b-launch">0</span></div>
       </div>
       <div class="narr" aria-live="polite">
         <h3 id="b-title"></h3>
@@ -291,7 +293,7 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
       <span class="src" id="sb-cfg"></span>
     </div>
     <div class="board" id="board"></div>
-    <p class="foot">Time: mean forward ms (eager and compiled over 100 passes, flash over 10, tile 16 over 3). Memory: <code>torch.cuda.memory_allocated()</code> after forward, i.e. what is kept for backward. Both axes are log scale. Launch counts are counted from the source, per forward pass. Sources: <code>results/writeups/4_1_pytorch_attention.md</code>, <code>4_2_torch_compile_a.md</code>, <code>4_2_2_flash_forward_pytorch_benchmark.md</code>.</p>
+    <p class="foot">Time: mean forward ms (eager, compiled and Triton over 100 passes, PyTorch flash over 10, its tile 16 over 3). Memory: <code>torch.cuda.memory_allocated()</code> after forward, i.e. what is kept for backward. Both axes are log scale. Launch counts are counted from the source, per forward pass. Sources: <code>results/writeups/4_1_pytorch_attention.md</code>, <code>4_2_torch_compile_a.md</code>, <code>4_2_2_flash_forward_pytorch_benchmark.md</code>, <code>4_2_3_flash_forward_triton_benchmark.md</code>.</p>
   </section>
 
   <section class="panel" aria-label="Bottlenecks">
@@ -300,7 +302,8 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
       <div class="take a"><h3>Eager: HBM bandwidth and N² memory</h3><p>Only the two matmuls do real math. The six elementwise and reduction kernels in between each stream a full B·N² tensor through HBM, which adds up to 7 reads and 5 writes of N² per forward. d_model barely matters (+15% from 16 to 128). Four N² tensors are live at the peak, so N = 16 384 (8 GiB each) runs out of memory.</p></div>
       <div class="take a"><h3>torch.compile: same algorithm, fewer passes</h3><p>Inductor fuses scale and softmax into one or two Triton kernels, cutting N² traffic to roughly 2 reads and 2 writes. That gives about 2× on forward. Two N² tensors are still saved for backward, so memory still grows as N², and backward still runs out of memory at 16 384.</p></div>
       <div class="take f"><h3>Flash (PyTorch): memory fixed</h3><p>Only Q, K, V, O and L are stored, which is O(B·N·d): 88 MiB vs 4.1 GiB at d = 64, N = 8192. The online softmax rescales old partial sums by α = exp(m_old − m_new), so the result is exact (see the toy check below the code).</p></div>
-      <div class="take h"><h3>Flash (PyTorch): launch-bound, ~10× slower</h3><p>There are (N/B)² tile pairs, each about 14 tiny kernels launched from a Python loop. At N = 16 384 with 128-tiles that is 16 384 pairs at ~0.16 ms each, about 11 µs per launch, with the GPU mostly idle. The tiles still go through HBM or L2 between kernels. The Triton kernel (4.2.2 b) fuses the whole inner loop so the tiles stay on-chip.</p></div>
+      <div class="take h"><h3>Flash (PyTorch): launch-bound, ~10× slower</h3><p>There are (N/B)² tile pairs, each about 14 tiny kernels launched from a Python loop. At N = 16 384 with 128-tiles that is 16 384 pairs at ~0.16 ms each, about 11 µs per launch, with the GPU mostly idle. The tiles still go through HBM or L2 between kernels. The Triton kernel fuses the whole loop so the tiles stay on-chip: 652.66 ms becomes 5.05 ms at d = 64, N = 8192.</p></div>
+      <div class="take f"><h3>Flash (Triton): one fused kernel</h3><p>One launch runs N/Bq × B programs. Each keeps Q_i, S_ij, P_ij, O_i, m and l in registers and shared memory, and streams the K/V tiles in with <code>tl.load</code>, so nothing N²-sized touches HBM. With the best tile it is 4–39× faster than eager and 2–17× faster than torch.compile from N = 1024 up, at ~19–28 TFLOP/s (30–45% of the A10's TF32 peak). Memory is the same O(B·N·d) as the PyTorch version. The new limit is shared memory: in fp32, 128-tiles do not fit at d ≥ 64 and 64-tiles do not fit at d = 128.</p></div>
     </div>
   </section>
 
@@ -308,15 +311,15 @@ table.diff td:first-child { font-weight: 600; width: 22%; }
     <h2>Side by side</h2>
     <div class="scroll">
       <table class="diff">
-        <thead><tr><th></th><th>Naive (eager)</th><th>Naive + torch.compile</th><th>FlashAttentionPytorch</th></tr></thead>
+        <thead><tr><th></th><th>Naive (eager)</th><th>Naive + torch.compile</th><th>FlashAttentionPytorch</th><th>FlashAttentionTriton</th></tr></thead>
         <tbody>
-          <tr><td>Materialises N × N?</td><td>Yes, up to 4 at once</td><td>Yes, 2 (scores and P)</td><td>No. One B·Bq·Bk tile at a time</td></tr>
-          <tr><td>Saved for backward</td><td>exp(x − max), P: 2·B·N² + Q, K, V</td><td>2·B·N² + Q, K, V</td><td>Q, K, V, O, L: O(B·N·d)</td></tr>
-          <tr><td>Kernels per forward</td><td>8, each huge</td><td>≈ 3–4</td><td>(N/B)² · 14 + (N/B) · 8, each tiny</td></tr>
-          <tr><td>N² HBM traffic</td><td>≈ 7 reads + 5 writes</td><td>≈ 2 reads + 2 writes</td><td>Same order as eager, but tile-sized and mostly L2-resident</td></tr>
-          <tr><td>Time scaling</td><td>4× per doubling of N, flat in d</td><td>4× per doubling of N, ~2× faster</td><td>Grows with the number of tiles: 4× per doubling of N, and larger tiles mean fewer of them</td></tr>
-          <tr><td>Softmax</td><td>Global row max and sum over the full row</td><td>Same, fused</td><td>Running m_i and l_i, rescaled by α each key tile, then L = m + log l</td></tr>
-          <tr><td>Fails at</td><td>N = 16 384, forward OOM</td><td>N = 16 384, backward OOM</td><td>Nothing in the grid. 2.7 s per pass at 16 384</td></tr>
+          <tr><td>Materialises N × N?</td><td>Yes, up to 4 at once</td><td>Yes, 2 (scores and P)</td><td>No. One B·Bq·Bk tile at a time</td><td>No. S_ij and P_ij exist only in registers</td></tr>
+          <tr><td>Saved for backward</td><td>exp(x − max), P: 2·B·N² + Q, K, V</td><td>2·B·N² + Q, K, V</td><td>Q, K, V, O, L: O(B·N·d)</td><td>Same, minus ~8 MiB (no cuBLAS workspace)</td></tr>
+          <tr><td>Kernels per forward</td><td>8, each huge</td><td>≈ 3–4</td><td>(N/B)² · 14 + (N/B) · 8, each tiny</td><td>1, with a grid of (N/Bq) × B programs</td></tr>
+          <tr><td>N² HBM traffic</td><td>≈ 7 reads + 5 writes</td><td>≈ 2 reads + 2 writes</td><td>Same order as eager, but tile-sized and mostly L2-resident</td><td>None. K and V are re-read once per query tile, (N/Bq)·2·B·N·d</td></tr>
+          <tr><td>Time scaling</td><td>4× per doubling of N, flat in d</td><td>4× per doubling of N, ~2× faster</td><td>Grows with the number of tiles: 4× per doubling of N, and larger tiles mean fewer of them</td><td>~3.9× per doubling of N from 4096. Compute-bound, best tile depends on d</td></tr>
+          <tr><td>Softmax</td><td>Global row max and sum over the full row</td><td>Same, fused</td><td>Running m_i and l_i, rescaled by α each key tile, then L = m + log l</td><td>Same, with α folded into <code>tl.dot(..., acc=α·O_i)</code></td></tr>
+          <tr><td>Fails at</td><td>N = 16 384, forward OOM</td><td>N = 16 384, backward OOM</td><td>Nothing in the grid. 2.7 s per pass at 16 384</td><td>Nothing in the grid at a tile that fits. 5.7–58 ms at 16 384 (best tile)</td></tr>
         </tbody>
       </table>
     </div>
@@ -364,7 +367,27 @@ const DATA = {
            64: [[0.99, 10.6], [11.37, 18.2], [166.78, 48.2], [652.66, 88.4], [2735.52, 168.6]],
            128: [[1.19, 13.1], [11.49, 28.2], [173.01, 88.2], [671.05, 168.4], [2659.70, 328.6]] },
   flash16: { 64: { 256: [42.01, 10.6], 1024: [678.91, 18.2] } },
+  // FlashAttentionTriton, per tile size Bq = Bk; "smem" = needs more than 99 KiB shared memory, does not launch
+  triton: {
+    16: { 16: [[0.09, 0.6], [0.18, 2.5], [2.03, 10.1], [7.97, 20.2], [31.96, 40.5]],
+          32: [[0.09, 0.6], [0.11, 2.5], [0.83, 10.1], [3.27, 20.2], [12.81, 40.5]],
+          64: [[0.09, 0.6], [0.09, 2.5], [0.44, 10.1], [1.61, 20.2], [6.25, 40.5]],
+          128: [[0.09, 0.6], [0.09, 2.5], [0.38, 10.1], [1.47, 20.2], [5.66, 40.5]] },
+    32: { 16: [[0.09, 1.3], [0.21, 5.0], [2.48, 20.1], [9.73, 40.2], [38.67, 80.5]],
+          32: [[0.09, 1.3], [0.14, 5.0], [1.34, 20.1], [5.24, 40.2], [20.57, 80.5]],
+          64: [[0.09, 1.3], [0.10, 5.0], [0.71, 20.1], [2.71, 40.2], [10.65, 80.5]],
+          128: [[0.09, 1.3], [0.12, 5.0], [1.02, 20.1], [3.96, 40.2], [14.88, 80.5]] },
+    64: { 16: [[0.09, 2.5], [0.27, 10.0], [3.64, 40.1], [14.22, 80.2], [57.50, 160.5]],
+          32: [[0.09, 2.5], [0.18, 10.0], [2.00, 40.1], [7.73, 80.2], [30.62, 160.5]],
+          64: [[0.09, 2.5], [0.14, 10.0], [1.32, 40.1], [5.05, 80.2], [19.71, 160.5]],
+          128: ["smem", "smem", "smem", "smem", "smem"] },
+    128: { 16: [[0.09, 5.0], [0.45, 20.0], [6.65, 80.1], [26.20, 160.2], [102.27, 320.5]],
+           32: [[0.09, 5.0], [0.28, 20.0], [3.83, 80.1], [14.77, 160.2], [58.28, 320.5]],
+           64: ["smem", "smem", "smem", "smem", "smem"],
+           128: ["smem", "smem", "smem", "smem", "smem"] },
+  },
 };
+const TILES = [16, 32, 64, 128];
 const B = 8, CAP = 22.5 * 1024 ** 3;
 const cfg = () => ({ d: +$("cfg-d").value, n: +$("cfg-n").value, t: +$("cfg-t").value });
 const n2Bytes = c => B * c.n * c.n * 4;
@@ -516,7 +539,51 @@ const B_CODE = [
   "    ⟦out|O[..., q_start : q_start + Bq, :] = (O_i / l_i[..., None]).to(Q.dtype)⟧",
   "    ⟦L|L[..., q_start : q_start + Bq] = m_i + torch.log(l_i)⟧",
 ];
-renderCode($("b-code"), B_CODE);
+const B_CODE_TRITON = [
+  "# flash_fwd_kernel: one program per (query tile, batch element)",
+  "⟦outer|query_tile_index = tl.program_id(0)⟧",
+  "⟦outer|batch_index = tl.program_id(1)⟧",
+  "⟦qi|Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option=\"zero\")⟧",
+  "⟦init|O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)⟧",
+  "⟦init|l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)⟧",
+  "⟦init|m_i = tl.full((Q_TILE_SIZE,), float(\"-inf\"), dtype=tl.float32)⟧",
+  "",
+  "⟦inner|for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):⟧",
+  "    ⟦kv|K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option=\"zero\")⟧",
+  "    ⟦kv|V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option=\"zero\")⟧",
+  "",
+  "    ⟦S|S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale⟧",
+  "    ⟦mnew|m_new = tl.maximum(m_i, tl.max(S_ij, axis=1))⟧",
+  "    ⟦P|P_ij = tl.exp(S_ij - m_new[:, None])⟧",
+  "    ⟦alpha|alpha = tl.exp(m_i - m_new)⟧",
+  "    ⟦l|l_i = alpha * l_i + tl.sum(P_ij, axis=1)⟧",
+  "    ⟦O|O_i = tl.dot(P_ij.to(V_j.dtype), V_j, acc=O_i * alpha[:, None])⟧",
+  "    ⟦mswap|m_i = m_new⟧",
+  "",
+  "    ⟦mswap|K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))⟧",
+  "    ⟦mswap|V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))⟧",
+  "",
+  "⟦out|O_i = O_i / l_i[:, None]⟧",
+  "⟦L|L_i = m_i + tl.log(l_i)⟧",
+  "⟦out|tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))⟧",
+  "⟦L|tl.store(L_block_ptr, L_i, boundary_check=(0,))⟧",
+];
+let bTriton = false;
+// static lane-B labels: [PyTorch, Triton]
+const B_LABELS = {
+  "b-name": ["FlashAttentionPytorch", "FlashAttentionTriton"],
+  "b-src": ["cs336_systems/flash_attention.py", "flash_attention.py · flash_fwd_kernel"],
+  "b-kv-cap": ["K_j, V_j tiles (read from HBM)", "K_j, V_j tiles (HBM → SRAM via tl.load)"],
+  "b-tmp-title": ["tile temporaries", "on-chip (one program)"],
+  "b-tmp-sub": ["B·Bq·Bk, reused each step", "registers / shared memory"],
+  "b-traffic-k": ["N² passes, summed over tiles (read / write)", "N² passes over HBM (read / write)"],
+  "b-launch-k": ["kernel launches so far (toy grid)", "kernel launches (whole forward)"],
+};
+function setLaneB() {
+  renderCode($("b-code"), bTriton ? B_CODE_TRITON : B_CODE);
+  for (const id in B_LABELS) $(id).textContent = B_LABELS[id][+bTriton];
+}
+setLaneB();
 
 // toy problem
 const TN = 64, TD = 8, TB = 16, NT = TN / TB;
@@ -681,34 +748,57 @@ function renderB() {
   highlight($("b-code"), H, "hl-f");
   const pairs = (c.n / c.t) ** 2, rows = c.n / c.t;
   const fl = DATA.flash[c.d][NS.indexOf(c.n)];
-  const ms = c.t === 128 ? fl[0] : (DATA.flash16[c.d] && DATA.flash16[c.d][c.n] ? DATA.flash16[c.d][c.n][0] : null);
+  const ms = c.t === 128 ? fl[0] : c.t !== 16 ? null : (DATA.flash16[c.d] && DATA.flash16[c.d][c.n] ? DATA.flash16[c.d][c.n][0] : null);
   const perPair = ms !== null ? `${(ms / pairs * 1000).toFixed(0)} µs per tile pair (measured)` : "this tile size was not measured for this config";
-  const T = {
+  const alphaText = a !== null && a < 0.999
+    ? `The max grew, so α = exp(m_old − m_new) = ${a.toFixed(3)} < 1 shrinks everything accumulated so far (red bars) before adding P_ij·V_j. This is the online-softmax trick, and it keeps the result exact.`
+    : `The max did not grow (α = ${a === null ? "—" : a.toFixed(3)}), so the old sums are kept as they are and P_ij is added: l_i += rowsum(P_ij), O_i += P_ij V_j.`;
+  const tri = DATA.triton[c.d][c.t][NS.indexOf(c.n)], smem = tri === "smem";
+  const tput = smem ? "" : ` (${(4 * B * c.n * c.n * c.d / tri[0] / 1e9).toFixed(1)} TFLOP/s)`;
+  const T = bTriton ? {
+    init: [`Program for Q${s.i}: load Q_i once`, `One Triton program owns query tile Q_i of one batch element. tl.load brings the Bq × d tile on-chip once, and O_i, l_i and m_i start in registers. The real kernel launches all ${fmtInt(rows * B)} programs (N/Bq × B) at once, and the A10's 72 SMs run them concurrently. The animation follows one of them.`,
+      ["ok", "One kernel launch for the whole forward pass"]],
+    a: [`Q${s.i} × K${s.j}: score tile on the tensor cores`, `tl.load streams K_j and V_j from HBM (often from L2) into shared memory, and tl.dot computes S_ij = Q_i K_jᵀ · scale in TF32. S_ij is a Bq × Bk register tile. It is never written to HBM, and nothing new is launched.`,
+      ["ok", smem ? "No N² traffic" : `No N² traffic. Measured at this config: ${fms(tri[0])}${tput}`]],
+    b: [`Q${s.i} × K${s.j}: new running max, exponentiate`, `tl.max and tl.exp work on the register tile in place. In the PyTorch version these were 4 kernel launches, each with an HBM or L2 round trip. Here they are a few instructions per element.`,
+      ["ok", "Fused: 0 launches, 0 bytes of HBM traffic"]],
+    c: [`Q${s.i} × K${s.j}: rescale and accumulate`, alphaText + " Here tl.dot(P_ij, V_j, acc=α·O_i) folds the rescale into the second matmul's accumulator.",
+      ["info", "The second tl.dot. O_i stays in fp32 registers across the whole key loop"]],
+    end: [`Q${s.i} done: one tl.store for O_i, one for L_i`, `O_i / l_i and L_i = m_i + log l_i are computed in registers and written with one tl.store each. These are the only HBM writes this program makes. Every S_ij and P_ij of row ${s.i} existed only on-chip.`,
+      ["ok", smem ? "Memory: Q, K, V, O, L only" : `Memory: Q, K, V, O, L only. Measured ${fmib(tri[1])} after forward`]],
+  }[s.t] : {
     init: [`Query tile Q${s.i}: reset the running state`, `Load the ${TB}-row slice Q_i and set O_i = 0, l_i = 0, m_i = −∞. This state is all the query tile carries across the key loop. It is B·Bq·(d + 2) floats, independent of N.`,
       ["info", "3 small allocation kernels"]],
     a: [`Q${s.i} × K${s.j}: score tile`, `S_ij = Q_i K_jᵀ · scale is a ${TB} × ${TB} tile, not an N × N matrix. In this PyTorch version it is still a separate cuBLAS launch, followed by a separate kernel for · scale.`,
       ["launch", `Launch-bound: 2 tiny kernels for a ${c.t}×${c.t} tile. With ${fmtInt(pairs)} pairs at this config, ${perPair}`]],
     b: [`Q${s.i} × K${s.j}: new running max, exponentiate`, `m_new = max(m_i, rowmax(S_ij)). Then P_ij = exp(S_ij − m_new). The new tile's bars are measured against the new max, while older bars still use the old max.`,
       ["launch", "4 more tiny kernels (amax, maximum, sub, exp), each over a tile that leaves most SMs idle"]],
-    c: [`Q${s.i} × K${s.j}: rescale and accumulate`, a !== null && a < 0.999
-      ? `The max grew, so α = exp(m_old − m_new) = ${a.toFixed(3)} < 1 shrinks everything accumulated so far (red bars) before adding P_ij·V_j. This is the online-softmax trick, and it keeps the result exact.`
-      : `The max did not grow (α = ${a === null ? "—" : a.toFixed(3)}), so the old sums are kept as they are and P_ij is added: l_i += rowsum(P_ij), O_i += P_ij V_j.`,
+    c: [`Q${s.i} × K${s.j}: rescale and accumulate`, alphaText,
       ["launch", "8 more kernels for B·Bq-sized vectors and one Bq×Bk @ Bk×d matmul: 14 launches per tile pair in total"]],
     end: [`Q${s.i} done: normalise and write O_i and L_i`, `O_i / l_i is the exact softmax output (bars match the naive dots). L_i = m_i + log l_i, one float per row, is all backward needs to recompute P later. Every tile of row ${s.i} was computed and then dropped.`,
       ["ok", "Memory: nothing N²-sized was ever stored"]],
   }[s.t];
   $("b-title").textContent = T[0]; $("b-text").textContent = T[1];
-  const chip = $("b-chip"); chip.className = "chip " + T[2][0];
-  chip.innerHTML = (T[2][0] === "launch" ? "<b>bottleneck</b> " : "") + esc(T[2][1]);
+  const chip = $("b-chip");
+  if (bTriton && smem) { chip.className = "chip oom"; chip.innerHTML = `<b>out of shared memory</b> at d = ${c.d} with ${c.t}-tiles: the K/V tiles plus Triton's pipelining need more than the A10's 99 KiB per block, so the kernel does not launch`; }
+  else { chip.className = "chip " + T[2][0]; chip.innerHTML = (T[2][0] === "launch" ? "<b>bottleneck</b> " : "") + esc(T[2][1]); }
 
   // counters
   let launches = 0, tr = 0, tw = 0;
   for (let i = 0; i <= bIdx; i++) { const t = BSTEPS[i].t; launches += LAUNCH[t]; if (TRAF[t]) { tr += TRAF[t][0]; tw += TRAF[t][1]; } }
   const tiles = NT * NT;
-  $("b-launch").textContent = `${launches}  ·  at this config: ${fmtInt(pairs * 14 + rows * 8)}`;
-  $("b-traffic").textContent = `${(tr / tiles).toFixed(2)} / ${(tw / tiles).toFixed(2)}`;
-  const bytes = inBytes(c) + B * c.n * 4 + 3 * B * c.t * c.t * 4;
-  $("b-mem").textContent = `${fmtBytes(bytes)} of 22.5 GiB`;
+  let bytes;
+  if (bTriton) {
+    $("b-launch").textContent = `1  ·  ${fmtInt(rows * B)} programs at this config`;
+    $("b-traffic").textContent = smem ? "—" : `0 / 0  ·  K, V streamed ${fmtInt(rows)}× ≈ ${fmtBytes(rows * 2 * B * c.n * c.d * 4)}`;
+    bytes = smem ? 0 : tri[1] * 1024 ** 2;
+    $("b-mem").textContent = smem ? "does not launch" : `${fmtBytes(bytes)} of 22.5 GiB (measured)`;
+  } else {
+    $("b-launch").textContent = `${launches}  ·  at this config: ${fmtInt(pairs * 14 + rows * 8)}`;
+    $("b-traffic").textContent = `${(tr / tiles).toFixed(2)} / ${(tw / tiles).toFixed(2)}`;
+    bytes = inBytes(c) + B * c.n * 4 + 3 * B * c.t * c.t * 4;
+    $("b-mem").textContent = `${fmtBytes(bytes)} of 22.5 GiB`;
+  }
   $("b-meter").firstElementChild.style.width = Math.max(0.6, bytes / CAP * 100) + "%";
   $("b-step").textContent = `step ${bIdx + 1} / ${BSTEPS.length}`;
 }
@@ -737,13 +827,17 @@ $("b-skip").addEventListener("click", () => {
   while (k < BSTEPS.length - 1 && !(BSTEPS[k].t === "end" && BSTEPS[k].i === cur)) k++;
   bIdx = k; renderB();
 });
+$("b-triton").addEventListener("click", e => {
+  bTriton = !bTriton; e.currentTarget.setAttribute("aria-pressed", bTriton);
+  setLaneB(); bIdx = 0; renderB(); pb.schedule();
+});
 $("a-compile").addEventListener("click", e => {
   aCompiled = !aCompiled; e.currentTarget.setAttribute("aria-pressed", aCompiled);
   aIdx = 0; renderA(); pa.schedule();
 });
 
 /* ================= scoreboard ================= */
-const T_MIN = 0.1, T_MAX = 10000, M_MIN = 1, M_MAX = 32768;
+const T_MIN = 0.05, T_MAX = 10000, M_MIN = 1, M_MAX = 32768;
 const lpos = (v, lo, hi) => Math.max(0, Math.min(1, Math.log10(v / lo) / Math.log10(hi / lo))) * 100;
 function lbar(v, lo, hi, cls, fmt) {
   const p = lpos(v, lo, hi);
@@ -761,21 +855,26 @@ function renderBoard() {
   const e = DATA.eager[c.d][ni], co = DATA.compiled[c.d][ni], f = DATA.flash[c.d][ni];
   const f16 = DATA.flash16[c.d] && DATA.flash16[c.d][c.n];
   const rows = c.n / 128, rows16 = c.n / 16;
+  const triSel = DATA.triton[c.d][c.t][ni];
+  let bestT = null;
+  for (const t of TILES) { const v = DATA.triton[c.d][t][ni]; if (v !== "smem" && (!bestT || v[0] < DATA.triton[c.d][bestT][ni][0])) bestT = t; }
   const L = [
     { name: "Naive (eager)", sub: "cs336_basics SDPA", cls: "c-eager", v: e, oom: "OOM in forward", launches: "8" },
     { name: "Naive + compile", sub: "torch.compile(SDPA)", cls: "c-comp", v: co, oom: "forward fits, OOM in backward", launches: "≈ 3–4" },
-    { name: "Flash, 128-tiles", sub: "FlashAttentionPytorch", cls: "c-flash", v: f, launches: fmtInt(rows * rows * 14 + rows * 8) },
-    { name: "Flash, 16-tiles", sub: "the test's tile size", cls: "c-flash16", v: f16 || null, na: "not measured for this config", launches: fmtInt(rows16 * rows16 * 14 + rows16 * 8) },
+    { name: "Flash PyTorch, 128", sub: "FlashAttentionPytorch", cls: "c-flash", v: f, launches: fmtInt(rows * rows * 14 + rows * 8) },
+    { name: "Flash PyTorch, 16", sub: "the test's tile size", cls: "c-flash16", v: f16 || null, na: "not measured for this config", launches: fmtInt(rows16 * rows16 * 14 + rows16 * 8) },
+    { name: `Flash Triton, ${c.t}`, sub: "flash_fwd_kernel, selected tile", cls: "c-triton", v: triSel === "smem" ? null : triSel, na: "out of shared memory (> 99 KiB per block)", naHot: true, launches: "1" },
+    { name: `Flash Triton, best (${bestT})`, sub: "fastest Bq = Bk at this d, N", cls: "c-triton", v: DATA.triton[c.d][bestT][ni], launches: "1" },
   ];
   let html = `<div class="brow headrow"><span>implementation</span><span>forward time (log)</span><span>memory kept after forward (log)</span><span style="text-align:right">kernel launches</span></div>`;
   for (const r of L) {
     html += `<div class="brow"><div class="impl">${r.name}<small>${r.sub}</small></div>`;
     if (r.v) html += lbar(r.v[0], T_MIN, T_MAX, r.cls, fms) + lbar(r.v[1], M_MIN, M_MAX, r.cls, fmib);
     else if (r.oom) html += naBar(r.oom) + naBar("2 × " + fmtBytes(n2Bytes(c)) + " needed", true);
-    else html += naBar(r.na, true) + naBar("", true);
+    else html += naBar(r.na, !r.naHot) + naBar("", true);
     html += `<div class="launch">${r.launches}</div></div>`;
   }
-  html += `<div class="brow" style="border-bottom:0;padding-top:2px"><span></span>${ticks([0.1, 1, 10, 100, 1000, 10000], T_MIN, T_MAX, v => v >= 1000 ? v / 1000 + "s" : v + "ms")}${ticks([1, 10, 100, 1024, 10240], M_MIN, M_MAX, v => v >= 1024 ? v / 1024 + "G" : v + "M")}<span></span></div>`;
+  html += `<div class="brow" style="border-bottom:0;padding-top:2px"><span></span>${ticks([0.05, 1, 10, 100, 1000, 10000], T_MIN, T_MAX, v => v >= 1000 ? v / 1000 + "s" : v + "ms")}${ticks([1, 10, 100, 1024, 10240], M_MIN, M_MAX, v => v >= 1024 ? v / 1024 + "G" : v + "M")}<span></span></div>`;
   $("board").innerHTML = html;
 }
 

@@ -49,11 +49,53 @@ Smoke test: `uv run python -m cs336_systems.attention_benchmark --impls eager fl
 
 There is no torch.compile run: Dynamo would unroll the Python tile loops into a (N/Bq)·(N/Bk)-iteration graph (see the writeup).
 
+## (b) Triton FlashAttention-2 forward
+
+Implementation: `flash_fwd_kernel` + `FlashAttentionTriton` in `cs336_systems/flash_attention.py`, returned by
+`tests/adapters.py::get_flashattention_autograd_function_triton`. The kernel has the handout's signature and grid
+`(T_q, batch_size)`. Each program loads its Q_i tile once and then runs a single loop over key tiles. It keeps
+O_i, l, m in fp32, casts P̃ to V's dtype before `tl.dot(P̃, V_j, acc=alpha * O_i)`, and advances the K/V block
+pointers at the end of the loop. O is cast to the output's element type on store, and L (fp32) is stored through a
+1-D block pointer. The wrapper flattens the leading batch dims into one before the launch and reshapes O and L back
+afterwards. Tiles are 16 × 16 for now (class attributes, not tuned yet). `is_causal` is saved on ctx but not applied
+yet, so the `[True]` case of the test still fails until (c):
+
+```bash
+uv run pytest -k test_flash_forward_pass_triton   # [False] passes, [True] fails (no mask yet)
+```
+
+Extra check against `_attention_and_lse` (in fp32) and `FlashAttentionPytorch`, max abs diff:
+
+| Q shape / K shape | dtype | O vs ref | L vs ref | O vs pytorch flash |
+|---|---|---:|---:|---:|
+| (2, 3, 64, 32) / (2, 3, 256, 32) | fp32 | 1.1e-3 | 1.7e-3 | 1.1e-3 |
+| (8, 1024, 128) | fp32 | 7.9e-4 | 1.3e-3 | 7.9e-4 |
+| (8, 1024, 64) | bf16 | 1.1e-3 | 1e-6 | 2.0e-3 |
+
+The ~1e-3 error in fp32 is from `tl.dot` using TF32 by default. That is fine for the test's 1e-2 tolerance.
+Quick timing at (8, 4096, 64) fp32 with `triton.testing.do_bench`: Triton 3.5 ms vs eager
+`scaled_dot_product_attention` 15.0 ms, with untuned tiles and no full benchmark yet.
+
+## Extra: benchmarking the Triton forward
+
+Writeup: `results/writeups/4_2_3_flash_forward_triton_benchmark.md`. `attention_benchmark.py` has a `flash_triton`
+impl. Like `flash_pytorch`, it is forward-only, uses square tiles of `--flash-tile-size` and refuses `--causal`. A
+tile size that needs more shared memory than the GPU has (Triton `OutOfResources`) is recorded as
+`"status": "out_of_shared_memory"`. Same grid and step counts as 4.1.1 (10 warm-up + 100 timed), swept over four
+tile sizes. Total run time is about 1 min:
+
+```bash
+out=results/data/4_2_3_flash_forward_triton.jsonl; rm -f $out
+for t in 16 32 64 128; do
+  uv run python -m cs336_systems.attention_benchmark --impls flash_triton --flash-tile-size $t --output $out 2>&1 \
+    | grep -v -i "cublas\|run_backward"
+done | tee results/data/4_2_3_flash_forward_triton.log
+```
+
+Smoke test: `uv run python -m cs336_systems.attention_benchmark --impls eager flash_triton --d-models 16 --seq-lens 256 --steps 3 --warmup-steps 1`.
+
 ## Next steps
 
-- (b) Triton forward kernel following Algorithm 1: `get_flashattention_autograd_function_triton`, test with
-  `uv run pytest -k test_flash_forward_pass_triton`. Use `FlashAttentionPytorch` as the reference when debugging,
-  tile by tile.
 - (c) Causal masking in the Triton kernel: an `is_causal: tl.constexpr` parameter, add -1e6 to the masked entries of
   S_ij, keep `ctx.is_causal = is_causal`. Same test, parametrized with `is_causal=True`.
 - flash_backward: implement `backward` (PyTorch, can be `torch.compile`d) from the saved `L, Q, K, V, O` with

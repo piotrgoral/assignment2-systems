@@ -5,12 +5,18 @@ queries are split into tiles of Q_TILE_SIZE and keys/values into tiles of K_TILE
 online with a running row max m and a running denominator l, so the full N_q x N_k attention matrix is never
 materialized. It is slow, but it gives us a reference to debug the Triton kernel against.
 
-The forward pass saves L (logsumexp of the attention scores), Q, K, V and O for the backward pass.
+FlashAttentionTriton runs the same algorithm as one fused Triton kernel (flash_fwd_kernel). The launch grid is
+(T_q, batch_size): each program instance owns one query tile of one batch element, keeps Q_i and the fp32 state
+(O_i, l, m) on chip and loops once over the key tiles. Leading batch dims are flattened into one before the launch.
+
+Both forward passes save L (logsumexp of the attention scores), Q, K, V and O for the backward pass.
 """
 
 import math
 
 import torch
+import triton
+import triton.language as tl
 
 
 class FlashAttentionPytorch(torch.autograd.Function):
@@ -50,6 +56,140 @@ class FlashAttentionPytorch(torch.autograd.Function):
             O[..., q_start : q_start + Bq, :] = (O_i / l_i[..., None]).to(Q.dtype)
             L[..., q_start : q_start + Bq] = m_i + torch.log(l_i)
 
+        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        raise NotImplementedError
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):  # fmt: skip
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    # Offset each pointer with the corresponding batch index multiplied with the batch stride for each tensor.
+    # Q, O and L point at this program's query tile; K and V start at the first key tile and advance in the loop.
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    # On-chip online softmax state, in fp32 whatever the input dtype.
+    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    m_i = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
+
+    for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale
+        m_new = tl.maximum(m_i, tl.max(S_ij, axis=1))
+        P_ij = tl.exp(S_ij - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        l_i = alpha * l_i + tl.sum(P_ij, axis=1)
+        O_i = tl.dot(P_ij.to(V_j.dtype), V_j, acc=O_i * alpha[:, None])
+        m_i = m_new
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    O_i = O_i / l_i[:, None]
+    L_i = m_i + tl.log(l_i)
+    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(L_block_ptr, L_i, boundary_check=(0,))
+
+
+class FlashAttentionTriton(torch.autograd.Function):
+    Q_TILE_SIZE = 16
+    K_TILE_SIZE = 16
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        assert Q.is_cuda and K.is_cuda and V.is_cuda, "Triton kernels need CUDA tensors"
+        n_queries, d = Q.shape[-2:]
+        n_keys = K.shape[-2]
+        Bq, Bk = FlashAttentionTriton.Q_TILE_SIZE, FlashAttentionTriton.K_TILE_SIZE
+        assert n_queries % Bq == 0 and n_keys % Bk == 0, "sequence lengths must be multiples of the tile sizes"
+        batch_shape = Q.shape[:-2]
+
+        # The grid has a single batch axis, so flatten all leading dims into one.
+        Q3, K3, V3 = Q.reshape(-1, n_queries, d), K.reshape(-1, n_keys, d), V.reshape(-1, n_keys, d)
+        batch_size = Q3.shape[0]
+        O = torch.empty_like(Q3)
+        L = torch.empty(batch_size, n_queries, device=Q.device, dtype=torch.float32)
+
+        flash_fwd_kernel[(triton.cdiv(n_queries, Bq), batch_size)](
+            Q3, K3, V3,
+            O, L,
+            Q3.stride(0), Q3.stride(1), Q3.stride(2),
+            K3.stride(0), K3.stride(1), K3.stride(2),
+            V3.stride(0), V3.stride(1), V3.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            n_queries, n_keys,
+            1 / math.sqrt(d),
+            D=d,
+            Q_TILE_SIZE=Bq,
+            K_TILE_SIZE=Bk,
+        )  # fmt: skip
+
+        O = O.view(Q.shape)
+        L = L.view(*batch_shape, n_queries)
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
         return O
