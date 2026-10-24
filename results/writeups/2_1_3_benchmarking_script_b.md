@@ -12,4 +12,4 @@ Values are mean ± standard deviation over 10 steps. Each phase is followed by `
 
 † Large was run with `--mode forward_backward`, so its total has no optimizer step. A full training step does not fit in the A10's 22 GB: the fp32 parameters, gradients and two AdamW states alone take about 16 B/param ≈ 15.5 GB, before activations. xl and 10B do not fit at all.
 
-Raw data: `results/data/2_1_benchmarking_script_b.jsonl` (log: `results/data/2_1_benchmarking_script_b.log`).
+Raw data: `results/data/2_1_3_benchmarking_script_b.jsonl` (log: `results/data/2_1_3_benchmarking_script_b.log`).

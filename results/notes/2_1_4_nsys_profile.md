@@ -108,7 +108,7 @@ nsys stats -r nvtx_sum $R
 nsys stats -r cuda_gpu_kern_sum --filter-nvtx=forward $R
 ```
 
-Compare (a) against the `timeit` numbers in `results/data/2_1_benchmarking_script_b.jsonl`.
+Compare (a) against the `timeit` numbers in `results/data/2_1_3_benchmarking_script_b.jsonl`.
 
 ## 4. GUI (optional)
 

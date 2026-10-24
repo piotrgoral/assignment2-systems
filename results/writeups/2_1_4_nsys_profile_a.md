@@ -19,7 +19,7 @@ nsys forward = the `forward` NVTX range (avg ± std over the 3 profiled steps, f
 | medium | 1024 | 2 | forward | 286.4 ± 3.0 | 288.2 ± 2.1 | -0.6% | — | — | — | — |
 | medium | 1024 | 2 | train | 284.1 ± 1.3 | 281.4 ± 0.4 | +1.0% | 563.1 | 561.9 | 126.6 | 124.9 |
 
-The ctx 512 timeit numbers also agree with the earlier `2_1_benchmarking_script_b` run (small 73.8 vs 73.1 ms, medium 234.2 vs 232.9 ms). The GPU is busy for almost the whole range: in small ctx 512, the forward pass's kernels add up to 72.2 ms of the 73.5 ms wall time.
+The ctx 512 timeit numbers also agree with the earlier `2_1_3_benchmarking_script_b` run (small 73.8 vs 73.1 ms, medium 234.2 vs 232.9 ms). The GPU is busy for almost the whole range: in small ctx 512, the forward pass's kernels add up to 72.2 ms of the 73.5 ms wall time.
 
 Setup: NVIDIA A10, fp32, nsys 2026.3.2, `--trace=cuda,nvtx`, capture range = `measure` (5 warm-up steps skipped, 3 steps recorded). `forward` mode runs the forward pass + loss with autograd enabled (no `--no-grad`); `train` = forward + backward + AdamW step. medium ctx 1024 uses batch 2 (batch 4 OOMs in training).
 

@@ -12,12 +12,12 @@ Smoke test: `uv run python -m cs336_systems.benchmark --size small --warmup-step
 ## (b) 5 warm-up steps
 
 ```bash
-rm -f results/data/2_1_benchmarking_script_b.jsonl
+rm -f results/data/2_1_3_benchmarking_script_b.jsonl
 for cfg in small:train medium:train large:forward_backward; do
   IFS=: read size mode <<< "$cfg"
   uv run python -m cs336_systems.benchmark --size $size --mode $mode --warmup-steps 5 --steps 10 \
-    --output results/data/2_1_benchmarking_script_b.jsonl
-done 2>&1 | tee results/data/2_1_benchmarking_script_b.log
+    --output results/data/2_1_3_benchmarking_script_b.jsonl
+done 2>&1 | tee results/data/2_1_3_benchmarking_script_b.log
 ```
 
 ## (c) 0 / 1 / 2 / 5 warm-up steps
@@ -26,14 +26,14 @@ Warm-up count is the outer loop, so the runs are back-to-back in that order (the
 copied from (b)):
 
 ```bash
-rm -f results/data/2_1_benchmarking_script_c.jsonl
+rm -f results/data/2_1_3_benchmarking_script_c.jsonl
 for w in 0 1 2 5; do
   for cfg in small:train medium:train large:forward_backward; do
     IFS=: read size mode <<< "$cfg"
     uv run python -m cs336_systems.benchmark --size $size --mode $mode --warmup-steps $w --steps 10 \
-      --output results/data/2_1_benchmarking_script_c.jsonl
+      --output results/data/2_1_3_benchmarking_script_c.jsonl
   done
-done 2>&1 | tee results/data/2_1_benchmarking_script_c.log
+done 2>&1 | tee results/data/2_1_3_benchmarking_script_c.log
 ```
 
 The writeup's "1st step" and "mean of steps 2–10" columns come from `timings.total.times_ms` (and the per-phase

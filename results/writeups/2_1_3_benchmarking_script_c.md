@@ -21,4 +21,4 @@ Total step time; small and medium use `--mode train`, large uses `--mode forward
 
 How the first step's extra time with w=0 splits across phases (vs. the mean of later steps): forward +198 / +188 / +180 ms and backward +54 / +50 / +47 ms for small / medium / large. The optimizer step shows no first-step penalty.
 
-Raw data: `results/data/2_1_benchmarking_script_c.jsonl` (log: `results/data/2_1_benchmarking_script_c.log`).
+Raw data: `results/data/2_1_3_benchmarking_script_c.jsonl` (log: `results/data/2_1_3_benchmarking_script_c.log`).
