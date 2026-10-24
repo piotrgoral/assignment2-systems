@@ -5,19 +5,27 @@ Example:
 
 Each step is also split into phases (forward / backward / optimizer), each followed by a synchronize,
 so the backward pass and optimizer step get their own timings.
+
+Warmup, the measured steps and each phase are wrapped in NVTX ranges ("warmup", "measure", "step_<i>",
+"forward", "backward", "optimizer"), so an nsys profile can skip warmup with
+`--capture-range=nvtx --nvtx-capture=measure` (needs NSYS_NVTX_PROFILER_REGISTER_ONLY=0).
 """
 
 import argparse
 import json
+import math
 import statistics
 import timeit
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 import torch
+import torch.cuda.nvtx as nvtx
+from einops import einsum
 
+import cs336_basics.model
 from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.nn_utils import cross_entropy, softmax
 from cs336_basics.optimizer import AdamW
 
 # Table 1 of the handout.
@@ -51,6 +59,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output", help="append the result as one JSON line to this file")
+    p.add_argument(
+        "--annotate-attention",
+        action="store_true",
+        help="swap in scaled dot-product attention with NVTX ranges around its parts",
+    )
     args = p.parse_args(argv)
     if args.no_grad and args.mode != "forward":
         p.error("--no-grad only applies to --mode forward")
@@ -77,6 +90,24 @@ def model_config(args: argparse.Namespace) -> dict:
     )
 
 
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """cs336_basics.model.scaled_dot_product_attention with NVTX ranges around scores / softmax / final matmul."""
+    with nvtx.range("computing attention scores"):
+        d_k = K.shape[-1]
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)
+
+    with nvtx.range("final matmul"):
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+
 def build_model(cfg: dict, device: torch.device) -> BasicsTransformerLM:
     model = BasicsTransformerLM(**cfg).to(device)
     model.train()
@@ -95,7 +126,7 @@ def synchronize(device: torch.device) -> None:
 
 
 class PhaseTimer:
-    """Times named phases of one step; synchronizes at the end of each phase."""
+    """Times named phases of one step (each in an NVTX range); synchronizes at the end of each phase."""
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -104,8 +135,9 @@ class PhaseTimer:
     @contextmanager
     def __call__(self, name: str) -> Iterator[None]:
         start = timeit.default_timer()
-        yield
-        synchronize(self.device)
+        with nvtx.range(name):
+            yield
+            synchronize(self.device)
         self.times[name] = timeit.default_timer() - start
 
 
@@ -158,17 +190,20 @@ def make_step_fn(
 
 def benchmark(step_fn: StepFn, warmup_steps: int, steps: int, device: torch.device) -> list[dict[str, float]]:
     """Returns per-step wall-clock times in seconds, as {"total": ..., <phase>: ...}; synchronizes after every step."""
-    for _ in range(warmup_steps):
-        step_fn(PhaseTimer(device))
-        synchronize(device)
+    with nvtx.range("warmup"):
+        for _ in range(warmup_steps):
+            step_fn(PhaseTimer(device))
+            synchronize(device)
 
     times = []
-    for _ in range(steps):
-        phase = PhaseTimer(device)
-        start = timeit.default_timer()
-        step_fn(phase)
-        synchronize(device)
-        times.append(dict(total=timeit.default_timer() - start, **phase.times))
+    with nvtx.range("measure"):
+        for i in range(steps):
+            with nvtx.range(f"step_{i}"):
+                phase = PhaseTimer(device)
+                start = timeit.default_timer()
+                step_fn(phase)
+                synchronize(device)
+                times.append(dict(total=timeit.default_timer() - start, **phase.times))
     return times
 
 
@@ -187,6 +222,8 @@ def main(argv: list[str] | None = None) -> dict:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    if args.annotate_attention:
+        cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     cfg = model_config(args)
     model = build_model(cfg, device)
