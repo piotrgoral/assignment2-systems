@@ -73,6 +73,8 @@ Extra check against `_attention_and_lse` (in fp32) and `FlashAttentionPytorch`, 
 | (8, 1024, 64) | bf16 | 1.1e-3 | 1e-6 | 2.0e-3 |
 
 The ~1e-3 error in fp32 is from `tl.dot` using TF32 by default. That is fine for the test's 1e-2 tolerance.
+(Later the kernel switched to `input_precision="ieee"` for fp32, and the fp32 error dropped to ~1e-6. See
+`4_2_flash_benchmarking.md`, "Fixes after review".)
 Quick timing at (8, 4096, 64) fp32 with `triton.testing.do_bench`: Triton 3.5 ms vs eager
 `scaled_dot_product_attention` 15.0 ms, with untuned tiles and no full benchmark yet.
 

@@ -12,6 +12,10 @@ FlashAttentionTriton runs the same algorithm as one fused Triton kernel (flash_f
 With is_causal=True, both forward passes add -1e6 to the scores of keys that come after the query. The Triton kernel
 also stops its key loop at the diagonal: later key tiles are fully masked and would add exactly 0.
 
+The Triton kernel takes any sequence lengths: out-of-range keys of the last tile are loaded as zeros and their scores
+set to -inf (as in the lecture's fused softmax), and out-of-range query rows are never stored. With fp32 inputs both
+tl.dot calls use input_precision="ieee" (true fp32, like the PyTorch baseline) instead of Triton's TF32 default.
+
 FlashAttentionTriton picks its tile sizes (and num_warps / num_stages) with triton.autotune, per sequence lengths,
 head dim, dtype and is_causal, unless Q_TILE_SIZE / K_TILE_SIZE are set on the class, which forces fixed tiles.
 
@@ -117,6 +121,7 @@ def flash_fwd_kernel(
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
 ):  # fmt: skip
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -181,15 +186,17 @@ def flash_fwd_kernel(
         K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale
+        S_ij = tl.dot(Q_i, tl.trans(K_j), input_precision=INPUT_PRECISION) * scale
+        k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
         if is_causal:
-            k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
             S_ij = tl.where(q_idx[:, None] >= k_idx[None, :], S_ij, S_ij - 1e6)
+        # Padded keys past N_KEYS must not count in the softmax (every tile has at least one real key).
+        S_ij = tl.where(k_idx[None, :] < N_KEYS, S_ij, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(S_ij, axis=1))
         P_ij = tl.exp(S_ij - m_new[:, None])
         alpha = tl.exp(m_i - m_new)
         l_i = alpha * l_i + tl.sum(P_ij, axis=1)
-        O_i = tl.dot(P_ij.to(V_j.dtype), V_j, acc=O_i * alpha[:, None])
+        O_i = tl.dot(P_ij.to(V_j.dtype), V_j, acc=O_i * alpha[:, None], input_precision=INPUT_PRECISION)
         m_i = m_new
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -199,16 +206,6 @@ def flash_fwd_kernel(
     L_i = m_i + tl.log(l_i)
     tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, L_i, boundary_check=(0,))
-
-
-def _prune_tile_configs(configs, named_args, **kwargs):
-    # Keep tiles that evenly divide the sequence lengths (padded keys would get score 0, not be masked out).
-    n_queries, n_keys = named_args["N_QUERIES"], named_args["N_KEYS"]
-    kept = [
-        c for c in configs
-        if n_queries % c.kwargs["Q_TILE_SIZE"] == 0 and n_keys % c.kwargs["K_TILE_SIZE"] == 0
-    ]  # fmt: skip
-    return kept or [triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16})]
 
 
 _TILE_CONFIGS = [
@@ -221,7 +218,6 @@ _TILE_CONFIGS = [
 flash_fwd_kernel_autotuned = triton.autotune(
     configs=_TILE_CONFIGS,
     key=["N_QUERIES", "N_KEYS", "D", "is_causal"],  # the autotuner also keys on the tensors' dtypes
-    prune_configs_by={"early_config_prune": _prune_tile_configs},
 )(flash_fwd_kernel)
 
 
@@ -237,7 +233,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         n_keys = K.shape[-2]
         Bq, Bk = FlashAttentionTriton.Q_TILE_SIZE, FlashAttentionTriton.K_TILE_SIZE
         autotune = Bq is None
-        assert autotune or (n_queries % Bq == 0 and n_keys % Bk == 0), "sequence lengths must be multiples of the tile sizes"
         batch_shape = Q.shape[:-2]
 
         # The grid has a single batch axis, so flatten all leading dims into one.
@@ -266,6 +261,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             1 / math.sqrt(d),
             D=d,
             is_causal=is_causal,
+            INPUT_PRECISION="ieee" if Q.dtype == torch.float32 else "tf32",
             **tiles,
         )  # fmt: skip
 

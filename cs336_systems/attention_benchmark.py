@@ -15,9 +15,9 @@ compiled afresh for every config (after `torch._dynamo.reset()`), so each shape 
 piling up recompiles. Compilation happens in the first warm-up pass, whose time is recorded as "first_iter_s".
 
 `--impls flash_pytorch` benchmarks the pure-PyTorch FlashAttention-2 forward (`FlashAttentionPytorch`), with square
-tiles of `--flash-tile-size`. It has no backward yet, so only the forward is timed (warm-up runs forward only) and
-"mem_before_backward_bytes" is the memory held after a forward pass with its graph alive (Q, K, V, O and L). It
-ignores masks, so it cannot be combined with `--causal`.
+tiles of `--flash-tile-size`. Only its forward is benchmarked here (warm-up runs forward only), and
+"mem_before_backward_bytes" is the memory held after a forward pass with its graph alive (Q, K, V, O and L). The
+wrapper calls it without `is_causal`, so it cannot be combined with `--causal`.
 
 `--impls flash_triton` does the same for the Triton FlashAttention-2 forward kernel (`FlashAttentionTriton`): square
 tiles of `--flash-tile-size`, forward only, no `--causal`. A tile size whose kernel needs more shared memory than the
